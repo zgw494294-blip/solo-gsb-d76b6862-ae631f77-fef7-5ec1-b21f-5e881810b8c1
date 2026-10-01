@@ -470,6 +470,46 @@ input[type="color"] {
 .applied-note { font-size: 12px; color: var(--ok); }
 .stale-note { font-size: 12px; color: #b45309; }
 
+/* ------------------------- 过渡步骤规划 ------------------------- */
+.transition-card { margin-top: 16px; }
+#transitionLimit { width: 150px; margin-right: 8px; }
+.order-slot .slot-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+.transition-steps { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+.trans-step {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fbfcfe;
+}
+.trans-step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.trans-step-tag {
+  background: var(--accent);
+  color: #fff;
+  border-radius: 999px;
+  padding: 1px 12px;
+  font-size: 12px;
+}
+.trans-step-tag.start {
+  background: #fff;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+.chip.swapped .dot {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.chip.swapped .cid { color: var(--accent); font-weight: 600; }
+
 /* ------------------------- 下一次背景测量建议 ------------------------- */
 .suggest-card { margin-top: 16px; }
 .suggest-cand-actions { margin-top: 8px; }

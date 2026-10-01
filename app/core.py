@@ -9,6 +9,9 @@
   在候选背景上渲染后以「任意两条预测色未取整 RGB 平方距离最小值」打分并推荐
 - 实测颜色复核：在选定候选背景上拿到实测色后，对容差内的全部叠序（不止建议页
   展示的前 12 条）计算该背景上的未取整 RGB 平方误差，留下不超过新测量上限者
+- 过渡步骤规划：给出当前实际底→顶叠序与非负有限的过渡总误差上限，在
+  「满足先后关系且旧样本总误差不超过上限」的状态图上，以相邻交换为边做 BFS，
+  求交换次数最少的完整路径；并列时按每步交换前两层 ID 对序列的字典序决胜
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from __future__ import annotations
 import itertools
 import math
 import re
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,7 +37,6 @@ MIN_CANDIDATES = 2
 MAX_CANDIDATES = 12
 MAX_SUGGEST_ORDERS = 12
 MAX_REVIEW_ORDERS = 12
-
 
 class CalibrationError(Exception):
     """输入校验失败，errors 为可直接展示给用户的中文错误列表。"""
@@ -911,3 +914,235 @@ def review_measurement(payload: Any) -> dict[str, Any]:
         "sampleCount": len(parsed.bg_hex),
         "canAppendSample": matched_count > 0 and len(parsed.bg_hex) < MAX_SAMPLES,
     }
+
+
+# ----------------------------------------------------------- 过渡步骤规划 --
+
+
+def _parse_full_order(
+    raw_order: Any, parsed: _Parsed, errors: list[dict[str, Any]]
+) -> list[int] | None:
+    """校验「恰好包含全部图层 ID 各一次」的底→顶顺序，成功返回下标序列。"""
+    n = len(parsed.ids)
+    id_set = {lid for lid in parsed.ids if lid}
+    order_ids: list[str] = []
+    ok = True
+    if not isinstance(raw_order, list):
+        errors.append(
+            _err("transition", "缺少 currentOrder 列表或其格式不正确：必须按底→顶顺序给出全部图层 ID")
+        )
+        return None
+    if len(raw_order) != n:
+        errors.append(
+            _err(
+                "transition",
+                f"currentOrder 必须恰好包含全部 {n} 个图层 ID（各一次），当前 {len(raw_order)} 个",
+            )
+        )
+        ok = False
+    seen: set[str] = set()
+    for x in raw_order:
+        if not isinstance(x, str) or not x.strip():
+            errors.append(_err("transition", f"currentOrder 中的图层 ID 非法：{x!r}（必须是已存在的图层 ID）"))
+            ok = False
+            continue
+        x = x.strip()
+        if x not in id_set:
+            errors.append(_err("transition", f"currentOrder 中的图层 ID 不存在：{x!r}"))
+            ok = False
+        elif x in seen:
+            errors.append(_err("transition", f"currentOrder 中图层 ID 重复：{x}，每个图层必须且只能出现一次"))
+            ok = False
+        else:
+            seen.add(x)
+        order_ids.append(x)
+    if not ok:
+        return None
+    return [parsed.seen_ids[x] for x in order_ids]
+
+
+def plan_transition(payload: Any) -> dict[str, Any]:
+    """从当前实际叠序调整到原求解最优叠序的最少相邻交换路径。
+
+    节点为满足全部先后关系的底→顶叠序，边为相邻两层交换（交换后仍须
+    合规）；只允许经过旧样本未取整 RGB 总平方误差不超过 transitionLimit
+    的节点。BFS 求最少交换次数；每个节点的后继按「交换前两层 ID 对」
+    字典序展开，首次到达目标的路径即字典序决胜后的最短路径。
+    """
+    parsed, errors = _parse_inputs(payload)
+    assert isinstance(payload, dict)  # _parse_inputs 已保证是 dict
+
+    current_idx = _parse_full_order(payload.get("currentOrder"), parsed, errors)
+    limit, _ = _parse_nonneg_number(
+        payload.get("transitionLimit"), "transition", "过渡总误差上限", errors
+    )
+
+    if errors:
+        raise CalibrationError(errors)
+    _raise_if_cycle(parsed)
+    assert current_idx is not None
+
+    n = len(parsed.ids)
+
+    # ---- 当前顺序必须符合全部先后关系 -------------------------------------
+    pos = [0] * n
+    for p, idx in enumerate(current_idx):
+        pos[idx] = p
+    for li, ui in parsed.pairs:
+        if pos[li] >= pos[ui]:
+            raise CalibrationError(
+                [
+                    _err(
+                        "transition",
+                        f"当前顺序不符合先后关系：{parsed.ids[li]} 必须在 {parsed.ids[ui]} 下方（底 → 顶）",
+                    )
+                ]
+            )
+
+    # ---- 枚举全部合规叠序及旧样本总误差 ------------------------------------
+    # 所有比较与展示统一使用 _sample_details 口径（与 /api/solve 的 totalSse
+    # 逐位一致），这样用户直接把求解返回的 totalSse 作为 transitionLimit 时
+    # 不会被不同运算顺序的浮点舍入差误伤；每个排列只渲染一次。
+    perms = _feasible_perms(n, parsed.pairs)
+    sse_cache: dict[tuple[int, ...], tuple[float, list[dict[str, Any]]]] = {}
+    best_key: tuple[float, tuple[str, ...]] | None = None
+    best_perm: tuple[int, ...] | None = None
+    for perm in perms:
+        samples, sse = _sample_details(parsed, list(perm), parsed.alphas)
+        sse_cache[perm] = (sse, samples)
+        id_seq = tuple(parsed.ids[idx] for idx in perm)
+        if best_key is None or (sse, id_seq) < best_key:
+            best_key = (sse, id_seq)
+            best_perm = perm
+    assert best_perm is not None
+
+    start = tuple(current_idx)
+    goal: tuple[int, ...] = best_perm
+    current_sse, current_samples = sse_cache[start]
+
+    # ---- 当前顺序的旧样本总误差不允许超过上限 -------------------------------
+    if current_sse > limit:
+        raise CalibrationError(
+            [
+                _err(
+                    "transition",
+                    f"当前顺序的旧样本总误差 {fmt_num(current_sse)} 已超过过渡总误差上限 "
+                    f"{fmt_num(limit)}，无法在此上限下开始调整，请放宽上限",
+                )
+            ]
+        )
+
+    allowed = {perm for perm, (sse, _s) in sse_cache.items() if sse <= limit}
+    current_display_sse = current_sse
+    target_display_sse, target_samples = sse_cache[goal]
+
+    result_base: dict[str, Any] = {
+        "transitionLimit": limit,
+        "currentOrder": [parsed.ids[i] for i in start],
+        "currentOrderIndexes": list(start),
+        "currentTotalSse": current_display_sse,
+        "currentSamples": current_samples,
+        "targetOrder": [parsed.ids[i] for i in goal],
+        "targetOrderIndexes": list(goal),
+        "targetTotalSse": target_display_sse,
+        "targetSamples": target_samples,
+        "bestSse": target_display_sse,
+        "feasibleCount": len(perms),
+        "allowedCount": len(allowed),
+        "alreadyTarget": start == goal,
+    }
+
+    # ---- 当前已是目标：空步骤 ----------------------------------------------
+    if start == goal:
+        return {**result_base, "reachable": True, "steps": [], "stepCount": 0, "statesVisited": 1}
+
+    # ---- BFS：后继按交换前（下方 ID, 上方 ID）字典序展开 ---------------------
+    parent: dict[tuple[int, ...], tuple[tuple[int, ...], tuple[str, str], int]] = {}
+    visited = {start}
+    queue: deque[tuple[int, ...]] = deque([start])
+    found = False
+
+    while queue and not found:
+        node = queue.popleft()
+        neighbors: list[tuple[tuple[str, str], int, tuple[int, ...]]] = []
+        for k in range(n - 1):
+            lower_idx = node[k]
+            upper_idx = node[k + 1]
+            # 显式先后关系禁止的相邻交换一律不合法（传递约束在此结构下自动满足）
+            violates = any(li == lower_idx and ui == upper_idx for li, ui in parsed.pairs)
+            if violates:
+                continue
+            nxt = list(node)
+            nxt[k], nxt[k + 1] = nxt[k + 1], nxt[k]
+            nxt_t = tuple(nxt)
+            if nxt_t not in allowed:
+                continue
+            pair = (parsed.ids[lower_idx], parsed.ids[upper_idx])
+            neighbors.append((pair, k, nxt_t))
+        neighbors.sort(key=lambda nb: nb[0])
+        for pair, k, nxt_t in neighbors:
+            if nxt_t in visited:
+                continue
+            visited.add(nxt_t)
+            parent[nxt_t] = (node, pair, k)
+            if nxt_t == goal:
+                found = True
+                break
+            queue.append(nxt_t)
+
+    if goal not in visited:
+        return {
+            **result_base,
+            "reachable": False,
+            "steps": [],
+            "stepCount": 0,
+            "statesVisited": len(visited),
+            "message": (
+                f"目标叠序 {result_base['targetOrder']} 虽满足先后关系且总误差 "
+                f"{fmt_num(target_display_sse)} ≤ 上限 {fmt_num(limit)}，但在只交换相邻两层、"
+                f"每一步都满足先后关系且旧样本总误差不超过上限的条件下，从当前叠序 "
+                f"{result_base['currentOrder']} 没有合规路径可以到达"
+            ),
+        }
+
+    # ---- 回溯路径（目标 → 当前），再反转为底 → 顶的执行顺序 ------------------
+    chain: list[tuple[tuple[int, ...], tuple[str, str], int]] = []
+    cur = goal
+    while cur != start:
+        prev, pair, k = parent[cur]
+        chain.append((cur, pair, k))
+        cur = prev
+    chain.reverse()
+
+    steps: list[dict[str, Any]] = []
+    for step_no, (node_after, pair, k) in enumerate(chain, start=1):
+        total_sse, samples = sse_cache[node_after]
+        steps.append(
+            {
+                "step": step_no,
+                "swapIndex": k,
+                "swappedLowerId": pair[0],
+                "swappedUpperId": pair[1],
+                "pair": [pair[0], pair[1]],
+                "order": [parsed.ids[i] for i in node_after],
+                "orderIndexes": list(node_after),
+                "totalSse": total_sse,
+                "samples": samples,
+            }
+        )
+
+    return {
+        **result_base,
+        "reachable": True,
+        "steps": steps,
+        "stepCount": len(steps),
+        "statesVisited": len(visited),
+    }
+
+
+def fmt_num(v: float) -> str:
+    """把 SSE / 上限数字格式化为简洁中文报错文本（避免过长浮点尾数）。"""
+    r = float(v)
+    if r == int(r):
+        return str(int(r))
+    return f"{r:.6g}"

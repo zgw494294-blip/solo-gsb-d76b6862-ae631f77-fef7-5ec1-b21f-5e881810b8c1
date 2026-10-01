@@ -21,6 +21,7 @@ const state = {
 let solveTimer = null;
 let lastErrorKey = "";
 let inflightToken = 0;
+let lastSolveResult = null; // 最近一次成功的求解结果（供过渡面板重置/默认上限）
 
 const $ = (sel) => document.querySelector(sel);
 const elLayers = $("#layers");
@@ -56,6 +57,7 @@ function scheduleSolve(delay = 200) {
   markInferStaleness();
   markSuggestStaleness();
   markReviewStaleness();
+  markTransitionStaleness();
 }
 
 // ------------------------------------------------------------ 渲染输入 --
@@ -299,6 +301,12 @@ document.addEventListener("input", (e) => {
       markReviewStaleness();
       break;
     }
+    case "transition-limit": {
+      const v = parseFloat(t.value);
+      transitionState.limit = t.value.trim() === "" || Number.isNaN(v) ? null : v;
+      markTransitionStaleness();
+      break;
+    }
   }
 });
 
@@ -431,6 +439,7 @@ async function runSolve() {
       showErrors(data.errors || [{ scope: "form", message: "求解失败" }]);
     } else {
       showErrors([]);
+      lastSolveResult = data;
       renderResult(data);
     }
   } catch (err) {
@@ -509,6 +518,7 @@ function renderResult(r) {
   $("#reviewCard").hidden = false;
   renderReviewBgOptions();
   syncInferPanel(r);
+  syncTransitionPanel(r);
 }
 
 function renderSample(s) {
@@ -735,6 +745,14 @@ document.addEventListener("change", (e) => {
     inferState.order[pos] = t.value;
     if (other !== -1 && prev) inferState.order[other] = prev;
     renderInferControls();
+  } else if (act === "transition-order") {
+    const pos = Number(t.dataset.pos);
+    const prev = orderSlotBefore;
+    // 与原占据新 ID 的槽位交换，保证当前顺序始终是全部图层的一个排列
+    const other = transitionState.order.findIndex((id, p) => p !== pos && id === t.value);
+    transitionState.order[pos] = t.value;
+    if (other !== -1 && prev) transitionState.order[other] = prev;
+    renderTransitionControls();
   } else if (act === "infer-pick") {
     const id = t.dataset.id;
     if (t.checked) inferState.picks.add(id);
@@ -752,6 +770,10 @@ document.addEventListener("focusin", (e) => {
     const pos = Number(e.target.dataset.pos);
     orderSlotBefore = inferState.order[pos];
   }
+  if (e.target.dataset && e.target.dataset.act === "transition-order") {
+    const pos = Number(e.target.dataset.pos);
+    orderSlotBefore = transitionState.order[pos];
+  }
 });
 
 document.addEventListener("click", (e) => {
@@ -762,6 +784,8 @@ document.addEventListener("click", (e) => {
   if (btn.dataset.act === "suggest-run") runSuggest();
   if (btn.dataset.act === "review-run") runReview();
   if (btn.dataset.act === "review-append") appendReviewSample();
+  if (btn.dataset.act === "transition-run") runTransition();
+  if (btn.dataset.act === "transition-reset") resetTransitionOrder();
 });
 
 async function runInfer() {
@@ -903,6 +927,304 @@ function applyInferResult() {
   renderInferResult(inferState.result);
   render();
   runSolve();
+}
+
+// ============================================================ 过渡步骤规划 ==
+
+const transitionState = {
+  order: [],        // 当前实际底→顶顺序（ID 数组）
+  limit: null,      // 过渡总误差上限（null 表示沿用最近一次求解的总误差）
+  result: null,     // 最近一次成功返回
+  resultKey: "",    // 结果产生时的输入指纹
+  _idSig: "",
+  _bestSse: null,   // 最近一次求解的最优总误差（用于默认上限与提示）
+};
+
+const elTransitionOrder = $("#transitionOrder");
+const elTransitionTarget = $("#transitionTarget");
+const elTransitionResult = $("#transitionResult");
+const elTransitionErrors = $("#transitionErrors");
+const elTransitionStatus = $("#transitionStatus");
+const elTransitionLimit = $("#transitionLimit");
+const elTransitionLimitHint = $("#transitionLimitHint");
+
+function transitionSignature() {
+  // 用于判断已有过渡步骤是否对应当前输入
+  return JSON.stringify({
+    layers: state.layers,
+    samples: state.samples,
+    relations: state.relations,
+    currentOrder: transitionState.order,
+    transitionLimit: transitionState.limit == null ? null : transitionState.limit,
+  });
+}
+
+function effectiveTransitionLimit() {
+  return transitionState.limit == null ? transitionState._bestSse : transitionState.limit;
+}
+
+function syncTransitionPanel(solveResult) {
+  $("#transitionCard").hidden = false;
+  const idSig = state.layers.map((l) => l.id).join("");
+  const layerSet = new Set(state.layers.map((l) => l.id));
+
+  transitionState._bestSse = solveResult.totalSse;
+  if (transitionState._idSig !== idSig) {
+    // 图层集合变化：当前顺序重置为最新最优叠序，上限默认取当前最优总误差
+    transitionState._idSig = idSig;
+    transitionState.order = [...solveResult.order];
+    transitionState.limit = null;
+    transitionState.result = null;
+    transitionState.resultKey = "";
+    elTransitionResult.innerHTML = "";
+    elTransitionErrors.hidden = true;
+  } else {
+    // 集合未变：补齐 / 剔除，保持当前实际顺序始终是全部图层的一个排列
+    transitionState.order = transitionState.order.filter((id) => layerSet.has(id));
+    solveResult.order.forEach((id) => {
+      if (!transitionState.order.includes(id)) transitionState.order.push(id);
+    });
+  }
+  renderTransitionControls(solveResult);
+  markTransitionStaleness();
+}
+
+function renderOrderSlots(container, ids) {
+  container.innerHTML = "";
+  ids.forEach((id, pos) => {
+    const layer = layerById(id);
+    const hex = (layer && normalizeHex(layer.color)) || "#000000";
+    const op = layer && Number.isFinite(layer.opacity) ? layer.opacity : null;
+    const slot = document.createElement("span");
+    slot.className = "order-slot";
+    slot.innerHTML = `
+      <span class="mini-dot" style="background:${hexToRgba(hex, op == null ? 1 : op)}"></span>
+      <span class="slot-id">${escapeHtml(id)}</span>
+      <span class="mini-op">${op == null ? "α 非法" : "α=" + Number(op.toFixed(2))}</span>
+    `;
+    container.appendChild(slot);
+    if (pos < ids.length - 1) {
+      const ar = document.createElement("span");
+      ar.className = "infer-arrow";
+      ar.textContent = "↑";
+      container.appendChild(ar);
+    }
+  });
+}
+
+function renderTransitionControls(solveResult) {
+  // ---- 当前顺序：可改的下拉槽 ----
+  elTransitionOrder.innerHTML = "";
+  transitionState.order.forEach((id, pos) => {
+    const layer = layerById(id);
+    const hex = (layer && normalizeHex(layer.color)) || "#000000";
+    const op = layer && Number.isFinite(layer.opacity) ? layer.opacity : null;
+    const slot = document.createElement("span");
+    slot.className = "order-slot";
+    slot.innerHTML = `
+      <select data-act="transition-order" data-pos="${pos}"
+              title="该位置（底 → 顶第 ${pos + 1} 层）的图层；改动会与原占该 ID 的槽位交换">
+        ${state.layers
+          .map(
+            (l) =>
+              `<option value="${escapeHtml(l.id)}"${l.id === id ? " selected" : ""}>${escapeHtml(
+                l.id
+              )}</option>`
+          )
+          .join("")}
+      </select>
+      <span class="mini-dot" style="background:${hexToRgba(hex, op == null ? 1 : op)}"></span>
+      <span class="mini-op">${op == null ? "α 非法" : "α=" + Number(op.toFixed(2))}</span>
+    `;
+    elTransitionOrder.appendChild(slot);
+    if (pos < transitionState.order.length - 1) {
+      const ar = document.createElement("span");
+      ar.className = "infer-arrow";
+      ar.textContent = "↑";
+      elTransitionOrder.appendChild(ar);
+    }
+  });
+
+  // ---- 目标顺序：只读展示 ----
+  renderOrderSlots(elTransitionTarget, solveResult.order);
+
+  // ---- 上限输入：空白时默认取最优总误差 ----
+  if (transitionState.limit == null && document.activeElement !== elTransitionLimit) {
+    elTransitionLimit.value = solveResult.totalSse == null ? "" : String(solveResult.totalSse);
+  }
+  elTransitionLimitHint.textContent =
+    `留空默认取最优总误差 ${fmtSse(solveResult.totalSse)}；当前实际叠序的旧样本总误差也必须不超过该上限`;
+
+  markTransitionStaleness();
+}
+
+function resetTransitionOrder() {
+  const r = lastSolveResult;
+  if (!r) return;
+  transitionState.order = [...r.order];
+  transitionState.limit = null;
+  renderTransitionControls(r);
+}
+
+function markTransitionStaleness() {
+  if (!transitionState.result) return;
+  const fresh = transitionSignature() === transitionState.resultKey;
+  const old = elTransitionResult.querySelector(".stale-note");
+  if (!fresh && !old) {
+    const note = document.createElement("div");
+    note.className = "stale-note";
+    note.textContent = "参与规划的输入已变化，以下交换步骤已失效，请重新规划。";
+    elTransitionResult.prepend(note);
+  } else if (fresh && old) {
+    old.remove();
+  }
+}
+
+function transitionResultFresh() {
+  if (!transitionState.result) return false;
+  return transitionSignature() === transitionState.resultKey;
+}
+
+async function runTransition() {
+  const limit = effectiveTransitionLimit();
+  const payload = {
+    layers: state.layers.map((l) => ({ id: l.id, color: l.color, opacity: l.opacity })),
+    samples: state.samples.map((s) => ({ background: s.background, target: s.target })),
+    relations: state.relations.map((r) => ({ lower: r.lower, upper: r.upper })),
+    currentOrder: transitionState.order,
+    transitionLimit: limit,
+  };
+  elTransitionStatus.textContent = "规划中…";
+  elTransitionStatus.className = "status busy";
+  elTransitionErrors.hidden = true;
+
+  try {
+    const resp = await fetch("/api/plan-transition", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    elTransitionStatus.textContent = "";
+    elTransitionStatus.className = "status";
+    if (!resp.ok) {
+      showTransitionErrors(data.errors || [{ scope: "form", message: "规划失败" }]);
+      return;
+    }
+    transitionState.result = data;
+    transitionState.resultKey = transitionSignature();
+    renderTransitionResult(data);
+  } catch (err) {
+    elTransitionStatus.textContent = "";
+    elTransitionStatus.className = "status";
+    showTransitionErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
+  }
+}
+
+function showTransitionErrors(errors) {
+  elTransitionErrors.innerHTML =
+    "<ul>" + errors.map((er) => `<li>${escapeHtml(er.message)}</li>`).join("") + "</ul>";
+  elTransitionErrors.hidden = false;
+}
+
+function renderTransitionResult(r) {
+  elTransitionErrors.hidden = true;
+  let html = `
+    <div class="metric-row">
+      <span>当前总误差：<b>${fmtSse(r.currentTotalSse)}</b></span>
+      <span>目标总误差：<b>${fmtSse(r.targetTotalSse)}</b></span>
+      <span>过渡总误差上限：<b>${fmtSse(r.transitionLimit)}</b></span>
+      <span>合规叠序：<b>${r.feasibleCount}</b> 条</span>
+      <span>上限内可停留：<b>${r.allowedCount}</b> 条</span>
+    </div>
+  `;
+
+  if (r.alreadyTarget) {
+    html += `
+      <div class="suggest-none">当前实际叠序就是目标最优叠序，无需交换（0 步）。</div>`;
+    elTransitionResult.innerHTML = html;
+    return;
+  }
+
+  if (!r.reachable) {
+    html += `
+      <div class="review-incompat">目标叠序不可到达：${escapeHtml(r.message)}</div>`;
+    elTransitionResult.innerHTML = html;
+    return;
+  }
+
+  html += `
+    <div class="suggest-sec-title">
+      最少交换 <b>${r.stepCount}</b> 步
+      （并列时按每步交换前「下方 ID, 上方 ID」对的字典序决胜；访问状态 ${r.statesVisited} 个）
+    </div>`;
+
+  // 起点（第 0 步）
+  html += `<div class="transition-steps">`;
+  html += renderTransitionStateBlock("起点", null, r.currentOrder, r.currentTotalSse, r.currentSamples);
+
+  r.steps.forEach((st) => {
+    html += renderTransitionStateBlock(
+      `第 ${st.step} 步`,
+      st,
+      st.order,
+      st.totalSse,
+      st.samples
+    );
+  });
+  html += `</div>`;
+  elTransitionResult.innerHTML = html;
+}
+
+function renderTransitionStateBlock(tag, step, order, totalSse, samples) {
+  const chips = order
+    .map((id) => {
+      const layer = layerById(id);
+      const hex = (layer && normalizeHex(layer.color)) || "#000000";
+      const op = layer && Number.isFinite(layer.opacity) ? layer.opacity : 1;
+      const swapped =
+        step && (id === step.swappedLowerId || id === step.swappedUpperId) ? " swapped" : "";
+      return `
+        <span class="chip${swapped}">
+          <span class="dot" style="background:${hexToRgba(hex, op)}" title="${escapeHtml(id)}"></span>
+          <span class="cid">${escapeHtml(id)}</span>
+        </span>`;
+    })
+    .join('<span class="order-sep">↑</span>');
+
+  let head;
+  if (step) {
+    head = `
+      <div class="trans-step-head">
+        <span class="trans-step-tag">${tag}</span>
+        <span>交换相邻两层
+          <b class="hexval">${escapeHtml(step.swappedLowerId)}</b>
+          <span class="hint">（下）⇅</span>
+          <b class="hexval">${escapeHtml(step.swappedUpperId)}</b>
+          <span class="hint">（上）</span>
+        </span>
+        <span class="spacer"></span>
+        <span class="review-meas">总误差 <b>${fmtSse(totalSse)}</b></span>
+      </div>`;
+  } else {
+    head = `
+      <div class="trans-step-head">
+        <span class="trans-step-tag start">${tag}</span>
+        <span class="hint">调整前叠序</span>
+        <span class="spacer"></span>
+        <span class="review-meas">总误差 <b>${fmtSse(totalSse)}</b></span>
+      </div>`;
+  }
+
+  const sampleHtml = samples.map(renderSample).join("");
+  return `
+    <div class="trans-step">
+      ${head}
+      <div class="checker"><div class="order-chips">
+        <span class="order-ends">底</span>${chips}<span class="order-ends">↑ 顶</span>
+      </div></div>
+      ${sampleHtml}
+    </div>`;
 }
 
 // ====================================================== 下一次背景测量建议 ==
