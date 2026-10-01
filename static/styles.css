@@ -606,3 +606,47 @@ input[type="color"] {
   align-items: center;
   flex-wrap: wrap;
 }
+
+/* ------------------------- 叠序过渡规划 ------------------------- */
+.transition-card { margin-top: 16px; }
+#transitionLimit { width: 130px; }
+
+.transition-cid {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+.transition-swap-btn {
+  padding: 1px 8px;
+  line-height: 1.4;
+  font-size: 11px;
+}
+
+.trans-step {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  background: #fbfcfe;
+}
+.trans-step[open] { background: #fff; }
+.trans-step summary {
+  cursor: pointer;
+  font-size: 13px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  user-select: none;
+}
+.trans-step summary .hint { margin-left: auto; }
+.trans-step-no {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-radius: 6px;
+  padding: 1px 8px;
+  font-size: 12px;
+}
+.trans-step-last { border-color: #bbf7d0; background: #f0fdf4; }
+.trans-step-last[open] { background: #f0fdf4; }
+.trans-inline-order { margin: 10px 0 4px; }
+.trans-order-panel b { color: var(--ink); }

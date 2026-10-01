@@ -64,6 +64,40 @@
         </div>
       </div>
 
+      <!-- 叠序过渡规划 -->
+      <div class="card transition-card" id="transitionCard" hidden>
+        <div class="card-head">
+          <h2>叠序过渡规划 <span class="hint">（从当前实际叠序，逐步相邻交换到最优叠序）</span></h2>
+          <span id="transitionStatus" class="status"></span>
+        </div>
+        <div id="transitionBody">
+          <div class="infer-field">
+            <div class="infer-field-label">
+              当前实际底 → 顶顺序（用 ▲ 按钮交换相邻两层；顺序须满足先后关系）
+            </div>
+            <div id="transitionOrder" class="infer-order"></div>
+            <div class="suggest-cand-actions">
+              <button id="transitionResetBtn" class="btn btn-ghost btn-small" data-act="transition-reset"
+                      type="button">重置为录入顺序</button>
+              <button class="btn btn-ghost btn-small" data-act="transition-use-target"
+                      type="button">填入最优顺序</button>
+            </div>
+          </div>
+          <div class="infer-field">
+            <div class="infer-field-label">过渡总误差上限（非负有限；每步交换后旧样本未取整 RGB 总平方误差均不得超过）</div>
+            <input id="transitionLimit" data-act="transition-limit" type="number"
+                   min="0" step="any" value="100000" />
+          </div>
+          <div class="infer-actions">
+            <button id="transitionRunBtn" class="btn btn-small" data-act="transition-run"
+                    type="button">规划最少交换路径</button>
+            <span id="transitionHint" class="hint">目标为校准结果按总误差、ID 序列决胜出的最优顺序</span>
+          </div>
+          <div id="transitionErrors" class="infer-errors" hidden></div>
+          <div id="transitionResult"></div>
+        </div>
+      </div>
+
       <!-- 下一次背景测量建议 -->
       <div class="card suggest-card" id="suggestCard" hidden>
         <div class="card-head">

@@ -21,6 +21,7 @@ const state = {
 let solveTimer = null;
 let lastErrorKey = "";
 let inflightToken = 0;
+let lastSolveResult = null; // 最近一次 /api/solve 成功结果（供「填入最优顺序」使用）
 
 const $ = (sel) => document.querySelector(sel);
 const elLayers = $("#layers");
@@ -56,6 +57,7 @@ function scheduleSolve(delay = 200) {
   markInferStaleness();
   markSuggestStaleness();
   markReviewStaleness();
+  markTransitionStaleness();
 }
 
 // ------------------------------------------------------------ 渲染输入 --
@@ -299,6 +301,12 @@ document.addEventListener("input", (e) => {
       markReviewStaleness();
       break;
     }
+    case "transition-limit": {
+      const v = parseFloat(t.value);
+      transitionState.limit = Number.isNaN(v) ? t.value : v;
+      markTransitionStaleness();
+      break;
+    }
   }
 });
 
@@ -386,6 +394,21 @@ document.addEventListener("click", (e) => {
     markSuggestStaleness();
     renderReviewBgOptions();
     markReviewStaleness();
+  } else if (act === "transition-swap") {
+    const p = Number(btn.dataset.pos);
+    if (Number.isInteger(p) && p >= 0 && p < transitionState.order.length - 1) {
+      const a = transitionState.order[p];
+      transitionState.order[p] = transitionState.order[p + 1];
+      transitionState.order[p + 1] = a;
+      renderTransitionControls();
+    }
+  } else if (act === "transition-reset") {
+    transitionState.order = state.layers.map((l) => l.id);
+    renderTransitionControls();
+  } else if (act === "transition-use-target") {
+    const tgt = lastSolveResult ? lastSolveResult.order : state.layers.map((l) => l.id);
+    transitionState.order = [...tgt];
+    renderTransitionControls();
   }
 });
 
@@ -431,6 +454,7 @@ async function runSolve() {
       showErrors(data.errors || [{ scope: "form", message: "求解失败" }]);
     } else {
       showErrors([]);
+      lastSolveResult = data;
       renderResult(data);
     }
   } catch (err) {
@@ -464,6 +488,10 @@ function showErrors(errors) {
   elStatus.className = "status";
   elResultBody.innerHTML = `<div class="result-empty">修正输入后将自动重新计算。</div>`;
   $("#inferCard").hidden = true;
+  $("#transitionCard").hidden = true;
+  elTransitionResult.innerHTML = "";
+  transitionState.result = null;
+  transitionState.resultKey = "";
 }
 
 // ------------------------------------------------------------ 结果渲染 --
@@ -507,8 +535,10 @@ function renderResult(r) {
   elResultBody.innerHTML = body;
   $("#suggestCard").hidden = false;
   $("#reviewCard").hidden = false;
+  $("#transitionCard").hidden = false;
   renderReviewBgOptions();
   syncInferPanel(r);
+  syncTransitionPanel(r);
 }
 
 function renderSample(s) {
@@ -762,6 +792,7 @@ document.addEventListener("click", (e) => {
   if (btn.dataset.act === "suggest-run") runSuggest();
   if (btn.dataset.act === "review-run") runReview();
   if (btn.dataset.act === "review-append") appendReviewSample();
+  if (btn.dataset.act === "transition-run") runTransition();
 });
 
 async function runInfer() {
@@ -1299,6 +1330,243 @@ function appendReviewSample() {
   renderSuggestControls();
   markReviewStaleness();
   runSolve();
+}
+
+// ============================================================ 叠序过渡规划 ==
+
+const transitionState = {
+  order: [],          // 当前实际顺序（ID 数组，底 → 顶）
+  limit: 100000,      // 过渡总误差上限（非负有限；非法输入原样交后端报错）
+  result: null,       // 最近一次成功返回
+  resultKey: "",      // 结果产生时的输入指纹
+  idSig: "",
+};
+
+const elTransitionResult = $("#transitionResult");
+const elTransitionErrors = $("#transitionErrors");
+const elTransitionStatus = $("#transitionStatus");
+
+function transitionSignature() {
+  // 用于判断已有过渡规划是否仍对应当前输入
+  return JSON.stringify({
+    layers: state.layers,
+    samples: state.samples,
+    relations: state.relations,
+    currentOrder: transitionState.order,
+    limit: transitionState.limit,
+  });
+}
+
+function syncTransitionPanel(solveResult) {
+  const idSig = state.layers.map((l) => l.id).join("");
+  const layerSet = new Set(state.layers.map((l) => l.id));
+  if (transitionState.idSig !== idSig) {
+    // 图层集合（ID 列表）变化：当前实际顺序重置为录入顺序（state.layers 顺序）
+    transitionState.idSig = idSig;
+    transitionState.order = state.layers.map((l) => l.id);
+    transitionState.result = null;
+    transitionState.resultKey = "";
+    elTransitionResult.innerHTML = "";
+    elTransitionErrors.hidden = true;
+  } else {
+    // 防御性补齐：过滤已不存在的 ID，追加新出现的 ID
+    transitionState.order = transitionState.order.filter((id) => layerSet.has(id));
+    state.layers.forEach((l) => {
+      if (!transitionState.order.includes(l.id)) transitionState.order.push(l.id);
+    });
+  }
+  // 同步上限输入框（首次或被外部清空时）
+  const limitInput = $("#transitionLimit");
+  if (limitInput && document.activeElement !== limitInput) {
+    limitInput.value = String(transitionState.limit);
+  }
+  renderTransitionControls();
+  markTransitionStaleness();
+}
+
+function renderTransitionControls() {
+  const box = $("#transitionOrder");
+  box.innerHTML = "";
+  transitionState.order.forEach((id, pos) => {
+    const layer = layerById(id);
+    const hex = (layer && normalizeHex(layer.color)) || "#000000";
+    const op = layer && Number.isFinite(layer.opacity) ? layer.opacity : null;
+    const slot = document.createElement("span");
+    slot.className = "order-slot";
+    slot.innerHTML = `
+      <button class="btn btn-ghost btn-small transition-swap-btn" type="button"
+              data-act="transition-swap" data-pos="${pos}"
+              title="把该层与紧上方一层交换（相邻交换）"
+              ${pos >= transitionState.order.length - 1 ? "disabled" : ""}>▲</button>
+      <span class="mini-dot" style="background:${hexToRgba(hex, op == null ? 1 : op)}"></span>
+      <span class="transition-cid">${escapeHtml(id)}</span>
+      <span class="mini-op">${op == null ? "α 非法" : "α=" + Number(op.toFixed(2))}</span>
+    `;
+    box.appendChild(slot);
+    if (pos < transitionState.order.length - 1) {
+      const ar = document.createElement("span");
+      ar.className = "infer-arrow";
+      ar.textContent = "↑";
+      box.appendChild(ar);
+    }
+  });
+  markTransitionStaleness();
+}
+
+function markTransitionStaleness() {
+  if (!transitionState.result) return;
+  const fresh = transitionSignature() === transitionState.resultKey;
+  const old = elTransitionResult.querySelector(".stale-note");
+  if (!fresh && !old) {
+    const note = document.createElement("div");
+    note.className = "stale-note";
+    note.textContent = "输入或当前顺序已变化，以下过渡路径可能过期，请重新规划。";
+    elTransitionResult.prepend(note);
+  } else if (fresh && old) {
+    old.remove();
+  }
+}
+
+function transitionResultFresh() {
+  return !!transitionState.result && transitionSignature() === transitionState.resultKey;
+}
+
+async function runTransition() {
+  const payload = {
+    layers: state.layers.map((l) => ({ id: l.id, color: l.color, opacity: l.opacity })),
+    samples: state.samples.map((s) => ({ background: s.background, target: s.target })),
+    relations: state.relations.map((r) => ({ lower: r.lower, upper: r.upper })),
+    currentOrder: [...transitionState.order],
+    transitionLimit: transitionState.limit,
+  };
+  elTransitionStatus.textContent = "规划中…";
+  elTransitionStatus.className = "status busy";
+  elTransitionErrors.hidden = true;
+
+  try {
+    const resp = await fetch("/api/plan-transition", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    elTransitionStatus.textContent = "";
+    elTransitionStatus.className = "status";
+    if (!resp.ok) {
+      showTransitionErrors(data.errors || [{ scope: "form", message: "过渡规划失败" }]);
+      return;
+    }
+    transitionState.result = data;
+    transitionState.resultKey = transitionSignature();
+    renderTransitionResult(data);
+  } catch (err) {
+    elTransitionStatus.textContent = "";
+    elTransitionStatus.className = "status";
+    showTransitionErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
+  }
+}
+
+function showTransitionErrors(errors) {
+  elTransitionErrors.innerHTML =
+    "<ul>" + errors.map((er) => `<li>${escapeHtml(er.message)}</li>`).join("") + "</ul>";
+  elTransitionErrors.hidden = false;
+}
+
+// 渲染一段底→顶叠序（带半透明色点）
+function renderOrderChips(orderIds) {
+  return orderIds
+    .map((id) => {
+      const layer = layerById(id) || { color: "#000000", opacity: 1 };
+      const rgba = hexToRgba(layer.color, layer.opacity);
+      return `
+        <span class="chip">
+          <span class="dot" style="background:${rgba}" title="${escapeHtml(id)}"></span>
+          <span class="cid">${escapeHtml(id)}</span>
+          <span class="cop">α=${Number(Number(layer.opacity).toFixed(2))}</span>
+        </span>`;
+    })
+    .join('<span class="order-sep">↑</span>');
+}
+
+function renderTransitionOrderBlock(tag, node) {
+  return `
+    <div class="order-panel trans-order-panel">
+      <div class="order-title">${tag}　总平方误差 <b>${fmtSse(node.totalSse)}</b>　${node.order
+        .map(escapeHtml)
+        .join(" ↑ ")}</div>
+      <div class="checker">
+        <div class="order-chips">
+          <span class="order-ends">底</span>
+          ${renderOrderChips(node.order)}
+          <span class="order-ends">↑ 顶</span>
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderTransitionResult(r) {
+  const cur = r.current;
+  const tgt = r.target;
+  let html = `
+    <div class="metric-row">
+      <span>过渡总误差上限：<b>${fmtSse(r.transitionLimit)}</b></span>
+      <span>合规叠序：<b>${r.feasibleCount}</b> 条</span>
+      <span>总误差不超过上限：<b>${r.withinLimitCount}</b> 条</span>
+      <span>最少交换次数：<b>${r.reachable ? (r.steps ? r.swapCount : 0) : "—"}</b></span>
+    </div>`;
+
+  html += renderTransitionOrderBlock(
+    r.alreadyAtTarget ? "当前顺序（即最优顺序，无需交换）" : "当前实际顺序（起点）",
+    cur
+  );
+  html += renderTransitionOrderBlock("目标：最优叠序（校准结果）", tgt);
+
+  if (r.alreadyAtTarget) {
+    html += `<div class="suggest-none">当前实际顺序已经是最优顺序，无需任何交换（空步骤）。</div>`;
+    elTransitionResult.innerHTML = html;
+    return;
+  }
+
+  if (!r.reachable) {
+    html += `
+      <div class="review-incompat">
+        目标叠序虽达标（最优总误差 ${fmtSse(tgt.totalSse)} ≤ 上限 ${fmtSse(
+      r.transitionLimit
+    )}），但<b>不可到达</b>：
+        在「每步只交换相邻两层、交换后仍满足先后关系、且旧样本总误差不超过上限」的全部中间状态中，
+        不存在从当前顺序到目标顺序的路径。请放宽过渡总误差上限，或直接调整当前实际顺序。
+      </div>`;
+    elTransitionResult.innerHTML = html;
+    return;
+  }
+
+  // 起点样本（与第一步交换前对应）
+  html += `
+    <details class="trans-step" open>
+      <summary><b>起点（未交换）</b>：${cur.order.map(escapeHtml).join(" ↑ ")}</summary>
+      ${cur.samples.map(renderSample).join("")}
+    </details>`;
+
+  html += r.steps
+    .map((st, k) => {
+      const isLast = k === r.steps.length - 1;
+      return `
+        <details class="trans-step${isLast ? " trans-step-last" : ""}" ${isLast ? "open" : ""}>
+          <summary>
+            <span class="trans-step-no">第 ${st.step} 步</span>
+            交换相邻两层：
+            <b>${escapeHtml(st.swapped.lower)}</b>（下）↑ <b>${escapeHtml(
+        st.swapped.upper
+      )}</b>（上）
+            <span class="hint">交换后总误差 ${fmtSse(st.totalSse)}${isLast ? "（已到达目标）" : ""}</span>
+          </summary>
+          ${renderTransitionOrderBlock("交换后叠序", st).replace("order-panel trans-order-panel", "order-panel trans-order-panel trans-inline-order")}
+          ${st.samples.map(renderSample).join("")}
+        </details>`;
+    })
+    .join("");
+
+  elTransitionResult.innerHTML = html;
 }
 
 // ------------------------------------------------------------ 启动 --
